@@ -389,10 +389,10 @@ with col1:
         help="Enter the full name of the client organization"
     )
     
-    # Service Type Multi-Select
+    # Service Type Multi-Select - UPDATED OPTIONS
     service_types = st.multiselect(
         "Service Type(s) *",
-        options=["MDR", "MIS", "DFIR", "SOCaaS"],
+        options=["Security Operations", "Cybersecurity Engineering", "Consulting"],
         default=[],
         help="Select one or more security services to include in the proposal"
     )
