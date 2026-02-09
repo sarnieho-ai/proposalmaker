@@ -9,12 +9,12 @@ st.set_page_config(
 )
 
 # Custom CSS for a professional look
-st.markdown(""", unsafe_allow_html=True)
+st.markdown("""
     <style>
     .main { background-color: #f5f7f9; }
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #004a99; color: white; }
     </style>
-    """, unsafe_allow_dict=True)
+    """, unsafe_allow_html=True)
 
 # 2. Sidebar - Setup & Instructions
 with st.sidebar:
