@@ -9,7 +9,7 @@ st.set_page_config(
 )
 
 # Custom CSS for a professional look
-st.markdown("""
+st.markdown(""", unsafe_allow_html=True)
     <style>
     .main { background-color: #f5f7f9; }
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #004a99; color: white; }
@@ -79,4 +79,5 @@ if st.button("🚀 Generate Winning Proposal"):
 
 # 5. Footer
 st.markdown("---")
+
 st.caption("Internal Use Only | DACTA SG Cybersecurity Presales")
