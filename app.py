@@ -152,7 +152,7 @@ def validate_inputs(
     if rfp_file is None:
         return False, "Please upload an RFP document."
 
-    allowed = [".pdf", ".docx", ".doc"]
+    allowed = [".pdf"]
     ext = "." + rfp_file.name.rsplit(".", 1)[-1].lower()
     if ext not in allowed:
         return False, f"Invalid file type '{ext}'. Allowed: {', '.join(allowed)}"
@@ -435,9 +435,10 @@ up_col1, up_col2 = st.columns(2)
 with up_col1:
     rfp_file = st.file_uploader(
         "RFP Document *",
-        type=["pdf", "docx", "doc"],
-        help="Request for Proposal — PDF or DOCX, max 10MB",
-        key="rfp_uploader"
+    type=["pdf"],
+    help="Upload the RFP as a PDF document (max 10MB). "
+         "Convert DOCX to PDF before uploading.",
+    key="rfp_uploader"
     )
     if rfp_file:
         st.success(f"✓ {rfp_file.name} ({rfp_file.size / 1024:.1f} KB)")
@@ -658,3 +659,4 @@ st.markdown("""
         </p>
     </div>
 """, unsafe_allow_html=True)
+
