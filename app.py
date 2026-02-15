@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import base64
 import time
 from datetime import datetime
 from typing import List, Dict
@@ -21,9 +20,9 @@ st.set_page_config(
 # SECRETS — ALL LOADED FROM STREAMLIT CLOUD
 # ============================================================
 
-MAKE_WEBHOOK_URL   = st.secrets["MAKE_WEBHOOK_URL"]
-SUPABASE_URL       = st.secrets["SUPABASE_URL"]
-SUPABASE_ANON_KEY  = st.secrets["SUPABASE_ANON_KEY"]
+MAKE_WEBHOOK_URL  = st.secrets["MAKE_WEBHOOK_URL"]
+SUPABASE_URL      = st.secrets["SUPABASE_URL"]
+SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
 
 # ============================================================
 # SUPABASE CLIENT
@@ -127,13 +126,36 @@ st.markdown("""
 # HELPER FUNCTIONS
 # ============================================================
 
-def encode_file_to_base64(uploaded_file) -> str | None:
-    """Encode an uploaded file to a base64 string"""
+def upload_rfp_to_supabase(
+    rfp_file,
+    submission_id: str
+) -> tuple[bool, str]:
+    """
+    Upload RFP PDF to Supabase Storage bucket 'rfp-documents'.
+    Returns (success, signed_url_or_error_message)
+    """
     try:
-        return base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+        file_path = f"{submission_id}/{rfp_file.name}"
+        file_bytes = rfp_file.getvalue()
+
+        # Upload file to Supabase Storage
+        supabase.storage \
+            .from_("rfp-documents") \
+            .upload(
+                path=file_path,
+                file=file_bytes,
+                file_options={"content-type": "application/pdf"}
+            )
+
+        # Generate signed URL valid for 1 hour (enough for Make.com to process)
+        signed = supabase.storage \
+            .from_("rfp-documents") \
+            .create_signed_url(file_path, expires_in=3600)
+
+        return True, signed["signedURL"]
+
     except Exception as e:
-        st.error(f"❌ Error encoding {uploaded_file.name}: {str(e)}")
-        return None
+        return False, f"Storage upload error: {str(e)}"
 
 
 def validate_inputs(
@@ -152,10 +174,9 @@ def validate_inputs(
     if rfp_file is None:
         return False, "Please upload an RFP document."
 
-    allowed = [".pdf"]
     ext = "." + rfp_file.name.rsplit(".", 1)[-1].lower()
-    if ext not in allowed:
-        return False, f"Invalid file type '{ext}'. Allowed: {', '.join(allowed)}"
+    if ext != ".pdf":
+        return False, "Only PDF files are accepted. Please convert your document to PDF first."
 
     size_mb = rfp_file.size / (1024 * 1024)
     if size_mb > 10:
@@ -164,21 +185,22 @@ def validate_inputs(
     return True, ""
 
 
-def log_submission_to_supabase(payload: Dict) -> tuple[bool, str]:
+def log_submission_to_supabase(payload: Dict, rfp_url: str) -> tuple[bool, str]:
     """
-    Insert initial proposal record into Supabase when submission begins.
+    Insert initial proposal record into Supabase.
     Returns (success, record_id_or_error_message)
     """
     try:
         data = {
             "submission_id":    payload["metadata"]["submission_id"],
             "client_name":      payload["client_name"],
-            "service_types":    payload["service_types"],
+            "service_types":    ", ".join(payload["service_types"]),
             "status":           "processing",
             "rfp_filename":     payload["rfp_document"]["filename"],
+            "rfp_storage_path": rfp_url,
             "tone":             payload["options"]["tone"],
-            "include_pricing":  payload["options"]["include_pricing"],
-            "include_timeline": payload["options"]["include_timeline"],
+            "include_pricing":  str(payload["options"]["include_pricing"]),
+            "include_timeline": str(payload["options"]["include_timeline"]),
             "additional_notes": payload["options"]["additional_notes"],
         }
 
@@ -189,8 +211,7 @@ def log_submission_to_supabase(payload: Dict) -> tuple[bool, str]:
         )
 
         if response.data:
-            record_id = response.data[0]["id"]
-            return True, record_id
+            return True, response.data[0]["id"]
         else:
             return False, "Supabase returned no data on insert."
 
@@ -203,12 +224,10 @@ def log_reference_docs_to_supabase(
     reference_files: list
 ) -> None:
     """
-    Insert reference document records linked to the proposal.
-    Fails silently — reference docs are optional.
+    Insert reference document records. Non-critical — fails silently.
     """
     if not reference_files:
         return
-
     try:
         rows = [
             {
@@ -219,10 +238,8 @@ def log_reference_docs_to_supabase(
             for f in reference_files
         ]
         supabase.table("reference_docs").insert(rows).execute()
-
     except Exception as e:
-        # Non-critical — log as warning, don't block submission
-        st.warning(f"⚠️ Reference docs logged with issue: {str(e)}")
+        st.warning(f"⚠️ Reference docs note: {str(e)}")
 
 
 def update_supabase_status(
@@ -230,19 +247,17 @@ def update_supabase_status(
     status: str,
     extra_fields: Dict = None
 ) -> None:
-    """Update proposal status in Supabase after webhook response"""
+    """Update proposal status in Supabase"""
     try:
         update_data = {"status": status}
         if extra_fields:
             update_data.update(extra_fields)
-
         supabase.table("proposals") \
             .update(update_data) \
             .eq("submission_id", submission_id) \
             .execute()
-
     except Exception as e:
-        st.warning(f"⚠️ Could not update Supabase status: {str(e)}")
+        st.warning(f"⚠️ Status update note: {str(e)}")
 
 
 def send_to_make(payload: Dict) -> tuple[bool, str, Dict]:
@@ -264,18 +279,17 @@ def send_to_make(payload: Dict) -> tuple[bool, str, Dict]:
             except Exception:
                 response_data = {}
             return True, "Proposal generation initiated successfully.", response_data
-
         elif response.status_code == 404:
             return False, "Webhook endpoint not found. Verify the URL in Streamlit secrets.", {}
         elif response.status_code == 429:
-            return False, "Rate limit reached on Make.com. Please wait a moment and retry.", {}
+            return False, "Rate limit reached on Make.com. Please wait and retry.", {}
         elif response.status_code == 500:
-            return False, "Make.com server error. Check your scenario for configuration issues.", {}
+            return False, "Make.com server error. Check your scenario for issues.", {}
         else:
             return False, f"Unexpected response (HTTP {response.status_code}): {response.text[:300]}", {}
 
     except requests.exceptions.Timeout:
-        return False, "Request timed out after 60 seconds. Make.com may be unreachable.", {}
+        return False, "Request timed out after 60 seconds.", {}
     except requests.exceptions.ConnectionError:
         return False, "Connection failed. Check your internet connection.", {}
     except requests.exceptions.RequestException as e:
@@ -309,7 +323,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # System status — derived from secrets, no user input needed
+    # System status derived from secrets — no user input needed
     st.markdown("### 🟢 System Status")
 
     checks = {
@@ -330,7 +344,7 @@ with st.sidebar:
     # AI pipeline display
     st.markdown("### 🤖 AI Pipeline")
     pipeline = [
-        ("🔍", "Gemini 1.5 Pro",    "Requirements Extraction"),
+        ("🔍", "Gemini 2.5 Flash",  "Requirements Extraction"),
         ("🧠", "DeepSeek",          "Gap Analysis"),
         ("🌐", "Perplexity",        "Market Research"),
         ("✍️", "Claude 3.5 Sonnet", "Proposal Drafting"),
@@ -356,14 +370,17 @@ with st.sidebar:
         **Steps:**
         1. Enter client name
         2. Select services
-        3. Upload RFP document
+        3. Upload RFP *(PDF only, max 10MB)*
         4. Add reference files *(optional)*
         5. Configure options
         6. Click **Generate Proposal**
 
         **Supported formats:**
-        - RFP: PDF, DOCX (max 10MB)
+        - RFP: PDF only
         - References: PDF, DOCX, TXT
+        
+        **Note:** Convert DOCX to PDF  
+        before uploading the RFP.
         """)
 
 # ============================================================
@@ -434,11 +451,10 @@ up_col1, up_col2 = st.columns(2)
 
 with up_col1:
     rfp_file = st.file_uploader(
-        "RFP Document *",
-    type=["pdf"],
-    help="Upload the RFP as a PDF document (max 10MB). "
-         "Convert DOCX to PDF before uploading.",
-    key="rfp_uploader"
+        "RFP Document * (PDF only)",
+        type=["pdf"],
+        help="Upload the RFP as a PDF. Max 10MB. Convert DOCX to PDF first.",
+        key="rfp_uploader"
     )
     if rfp_file:
         st.success(f"✓ {rfp_file.name} ({rfp_file.size / 1024:.1f} KB)")
@@ -464,8 +480,8 @@ with st.expander("⚙️ Proposal Options"):
     opt_col1, opt_col2 = st.columns(2)
 
     with opt_col1:
-        include_pricing  = st.checkbox("Include Pricing Section",   value=True)
-        include_timeline = st.checkbox("Include Project Timeline",  value=True)
+        include_pricing  = st.checkbox("Include Pricing Section",  value=True)
+        include_timeline = st.checkbox("Include Project Timeline", value=True)
 
     with opt_col2:
         tone_preference = st.selectbox(
@@ -476,7 +492,8 @@ with st.expander("⚙️ Proposal Options"):
 
     additional_notes = st.text_area(
         "Additional Instructions for the AI",
-        placeholder="e.g., emphasize OT/ICS experience, reference MAS TRM compliance, avoid mentioning competitors by name...",
+        placeholder="e.g., emphasise OT/ICS experience, reference MAS TRM compliance, "
+                    "avoid mentioning competitors by name...",
         height=100
     )
 
@@ -508,40 +525,35 @@ if generate_button:
     else:
         submission_id = f"DACTA-{int(time.time())}"
 
-        # ── Step 1: Encode Files ──────────────────────────────
         with st.status("⚙️ Processing submission...", expanded=True) as status_box:
 
-            st.write("📎 Encoding RFP document...")
-            rfp_base64 = encode_file_to_base64(rfp_file)
+            # ── Step 1: Upload RFP to Supabase Storage ────────────
+            st.write("☁️ Uploading RFP to secure storage...")
+            upload_ok, rfp_url = upload_rfp_to_supabase(rfp_file, submission_id)
 
-            if rfp_base64 is None:
-                status_box.update(label="❌ File encoding failed", state="error")
+            if not upload_ok:
+                status_box.update(
+                    label="❌ RFP upload to storage failed",
+                    state="error"
+                )
+                st.error(f"**Storage Error:** {rfp_url}")
                 st.stop()
 
-            # Encode reference files
-            reference_data = []
-            if reference_files:
-                st.write(f"📎 Encoding {len(reference_files)} reference file(s)...")
-                for ref in reference_files:
-                    ref_b64 = encode_file_to_base64(ref)
-                    if ref_b64:
-                        reference_data.append({
-                            "filename": ref.name,
-                            "content":  ref_b64,
-                            "size":     ref.size
-                        })
+            st.write("✓ RFP uploaded to Supabase Storage")
 
-            # ── Step 2: Build Payload ─────────────────────────
+            # ── Step 2: Build Payload (URL, not base64) ───────────
             payload = {
                 "client_name":   client_name.strip(),
                 "service_types": service_types,
                 "rfp_document": {
                     "filename": rfp_file.name,
-                    "content":  rfp_base64,
+                    "url":      rfp_url,
                     "size":     rfp_file.size,
-                    "type":     rfp_file.type
                 },
-                "reference_documents": reference_data,
+                "reference_documents": [
+                    {"filename": f.name, "size": f.size}
+                    for f in (reference_files or [])
+                ],
                 "options": {
                     "include_pricing":  include_pricing,
                     "include_timeline": include_timeline,
@@ -555,24 +567,21 @@ if generate_button:
                 }
             }
 
-            # ── Step 3: Log to Supabase ───────────────────────
-            st.write("🗄️ Logging submission to Supabase...")
-            sb_ok, sb_result = log_submission_to_supabase(payload)
+            # ── Step 3: Log to Supabase ───────────────────────────
+            st.write("🗄️ Logging submission to database...")
+            sb_ok, sb_result = log_submission_to_supabase(payload, rfp_url)
 
             if sb_ok:
-                st.write(f"✓ Supabase record created → `{sb_result}`")
-                # Log reference docs linked to proposal ID
+                st.write(f"✓ Database record created → `{sb_result}`")
                 log_reference_docs_to_supabase(sb_result, reference_files)
             else:
-                # Non-critical — warn but don't block
-                st.warning(f"⚠️ Supabase logging issue: {sb_result}")
+                st.warning(f"⚠️ Database note: {sb_result}")
 
-            # ── Step 4: Send to Make.com ──────────────────────
-            st.write("🔗 Sending to Make.com workflow...")
+            # ── Step 4: Send to Make.com ──────────────────────────
+            st.write("🔗 Triggering AI workflow via Make.com...")
             success, message, response_data = send_to_make(payload)
 
             if success:
-                # Update Supabase status to reflect webhook receipt
                 update_supabase_status(
                     submission_id,
                     status="draft_ready" if response_data else "processing"
@@ -581,16 +590,14 @@ if generate_button:
                     label="✅ Proposal generation triggered successfully!",
                     state="complete"
                 )
-
             else:
-                # Mark as failed in Supabase
                 update_supabase_status(submission_id, status="failed")
                 status_box.update(
                     label="❌ Submission failed — see details below",
                     state="error"
                 )
 
-        # ── Post-submission UI ────────────────────────────────
+        # ── Post-submission UI ────────────────────────────────────
         if success:
             st.success("✅ Your proposal request has been submitted!")
             st.balloons()
@@ -610,13 +617,14 @@ if generate_button:
             | **Timestamp** | {datetime.now().strftime('%d %b %Y %H:%M SGT')} |
 
             **What happens next:**
-            1. ✅ Payload received by Make.com
-            2. ⏳ Gemini extracts RFP requirements
-            3. ⏳ DeepSeek performs gap analysis
-            4. ⏳ Perplexity researches market data
-            5. ⏳ Claude drafts the final proposal
-            6. 📁 Output saved to Supabase
-            7. 📧 You'll be notified when the draft is ready *(~3–5 minutes)*
+            1. ✅ RFP uploaded to secure storage
+            2. ✅ Payload sent to Make.com
+            3. ⏳ Gemini 2.5 Flash extracts RFP requirements
+            4. ⏳ DeepSeek performs gap analysis
+            5. ⏳ Perplexity researches market data
+            6. ⏳ Claude drafts the final proposal
+            7. 📁 All outputs saved to database
+            8. 📧 You'll be notified when ready *(~3–5 minutes)*
             """)
 
         else:
@@ -624,27 +632,27 @@ if generate_button:
             st.error(f"**Reason:** {message}")
 
             with st.expander("🔧 Troubleshooting Guide"):
-                st.markdown("""
+                st.markdown(f"""
                 **1. Webhook URL Invalid**
                 - Go to Streamlit Cloud → Settings → Secrets
-                - Verify `MAKE_WEBHOOK_URL` is correct and has no trailing spaces
+                - Verify `MAKE_WEBHOOK_URL` is correct with no trailing spaces
 
                 **2. Make.com Scenario Inactive**
                 - Log into Make.com
-                - Ensure your scenario is **turned ON** (toggle in bottom-left)
+                - Ensure your scenario is **turned ON**
                 - Check the scenario has no errors in the last execution log
 
                 **3. Connection Timeout**
-                - The request timed out after 60 seconds
+                - Request timed out after 60 seconds
                 - Check Make.com's status page for outages
 
-                **4. Supabase Issues**
-                - Verify `SUPABASE_URL` and `SUPABASE_ANON_KEY` in secrets
-                - Confirm the `proposals` table exists and RLS is configured
+                **4. Supabase Storage Issues**
+                - Confirm the `rfp-documents` bucket exists in Supabase Storage
+                - Verify RLS policies allow INSERT on the bucket
 
-                **Still stuck?** Share the Submission ID with your admin:
-                `{}`
-                """.format(submission_id))
+                **Submission ID for admin reference:**
+                `{submission_id}`
+                """)
 
 # ============================================================
 # FOOTER
@@ -659,4 +667,3 @@ st.markdown("""
         </p>
     </div>
 """, unsafe_allow_html=True)
-
