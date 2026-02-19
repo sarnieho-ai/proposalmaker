@@ -524,7 +524,7 @@ if generate_button:
         st.error(f"❌ {error_msg}")
 
     else:
-        submission_id = f"DACTA-{uuid.uuid4().hex[:12]}"
+        submission_id = f"DACTA-{uuid.uuid4().hex[:12].upper()}"
 
         with st.status("⚙️ Processing submission...", expanded=True) as status_box:
 
@@ -668,4 +668,5 @@ st.markdown("""
         </p>
     </div>
 """, unsafe_allow_html=True)
+
 
